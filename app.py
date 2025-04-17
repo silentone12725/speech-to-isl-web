@@ -1,0 +1,398 @@
+from flask import Flask, render_template, request, jsonify, send_from_directory
+import os
+import re
+import pandas as pd
+import speech_recognition as sr
+from moviepy.editor import VideoFileClip, concatenate_videoclips
+import subprocess
+import tempfile
+import uuid
+import time
+
+app = Flask(__name__)
+
+# Global paths
+DATASET_DIR = "NLP_dataset"
+YT_DOWNLOADS_DIR = "yt_downloads"
+CSV_PATH = "NLP_videos.csv"
+UPLOAD_FOLDER = "uploads"
+TEMP_FOLDER = "temp"
+STATIC_VIDEOS = "static/videos"
+
+# Ensure all required directories exist
+for directory in [DATASET_DIR, YT_DOWNLOADS_DIR, UPLOAD_FOLDER, TEMP_FOLDER, STATIC_VIDEOS]:
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+# Load CSV data once at startup for better performance
+videos_df = None
+if os.path.exists(CSV_PATH):
+    videos_df = pd.read_csv(CSV_PATH)
+
+def download_and_convert_video(url, download_path, filename):
+    """Download and convert video from a non-YouTube URL"""
+    video_path = os.path.join(download_path, filename + ".mp4")
+    
+    # Check if the video already exists
+    if os.path.exists(video_path):
+        return True
+    
+    try:
+        # Send a request to get the video content
+        response = requests.get(url, stream=True)
+        response.raise_for_status()  # Check for HTTP errors
+        
+        # Write the content to a file
+        with open(video_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"Error downloading video from {url}: {str(e)}")
+        return False
+
+def download_video(link, yt_path, yt_name):
+    """Download a video from YouTube or non-YouTube sources"""
+    # Check if the link is a YouTube link
+    if "youtube.com" in link or "youtu.be" in link:
+        output_path = os.path.join(yt_path, f"{yt_name}.%(ext)s")
+        
+        # Check if video already exists
+        if os.path.exists(os.path.join(yt_path, f"{yt_name}.mp4")):
+            return True
+        
+        # Command for yt-dlp
+        command = [
+            "yt-dlp",
+            "--format", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4",
+            "--output", output_path,
+            "--merge-output-format", "mp4",
+            link
+        ]
+        
+        try:
+            subprocess.run(command, check=True)
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"Error downloading YouTube video: {str(e)}")
+            return False
+    else:
+        # Download using custom function for non-YouTube videos
+        filename = yt_name  # Use the same name for non-YouTube videos
+        return download_and_convert_video(link, yt_path, filename)
+
+def cut_video(word, yt_name, start_min, start_sec, end_min, end_sec):
+    """Cut a section from a video"""
+    start = int(start_min) * 60 + int(start_sec)
+    end = int(end_min) * 60 + int(end_sec)
+
+    in_path = os.path.join(YT_DOWNLOADS_DIR, f"{yt_name}.mp4")
+    out_path = os.path.join(DATASET_DIR, f"{word}.mp4")
+
+    # Check if cut video already exists
+    if os.path.exists(out_path):
+        return out_path
+
+    if not os.path.exists(in_path):
+        return None
+
+    try:
+        clip = VideoFileClip(in_path).subclip(start, end)
+        clip.write_videofile(out_path, codec="libx264", audio_codec="aac")
+        return out_path
+    except Exception as e:
+        print(f"Error cutting video for {word}: {str(e)}")
+        return None
+
+def text_to_isl(sentence):
+    """Convert English text to ISL representation"""
+    # Remove punctuation
+    pattern = r'[^\w\s]'
+    sentence = re.sub(pattern, '', sentence)
+    
+    # Simple stopword filtering
+    stopwords_set = set(['a', 'an', 'the', 'is', 'to', 'The', 'in', 'of', 'us', 'and', 'are', 'this', 'that', 'it'])
+    
+    # Convert to lowercase and filter out stopwords, but preserve "I" as is
+    words = []
+    for word in sentence.split():
+        if word.lower() not in stopwords_set:
+            if word == "I":
+                words.append(word)  # Preserve uppercase I
+            else:
+                words.append(word.lower())
+    
+    # Join the words back into a sentence
+    isl_sentence = " ".join(words)
+    
+    return isl_sentence
+
+def recognize_speech_from_file(audio_file_path):
+    """Recognize speech from an audio file"""
+    recognizer = sr.Recognizer()
+    
+    try:
+        with sr.AudioFile(audio_file_path) as source:
+            audio_data = recognizer.record(source)
+            text = recognizer.recognize_google(audio_data)
+            return text
+    except Exception as e:
+        print(f"Speech recognition error: {str(e)}")
+        return None
+
+def is_single_letter(word):
+    """Check if the word is a single letter (for special handling)"""
+    return len(word) == 1 and word.isalpha()
+
+def process_word_for_video(word, videos_df):
+    """Process a single word to find appropriate video clip"""
+    # Special case for "I" (pronoun) surrounded by spaces
+    if word == " I " and (videos_df['yt_name'] == "me").any():
+        # Check if "I" is surrounded by spaces (independent)
+        idx = videos_df.index[videos_df['yt_name'] == "me"].tolist()[0]
+        return get_video_info(idx, videos_df)
+    
+    # Special case for "I" not surrounded by spaces
+    if word == "I" and (videos_df['yt_name'] == "double handed").any():
+        # Use the "double handed" version
+        idx = videos_df.index[videos_df['yt_name'] == "double handed"].tolist()[0]
+        return get_video_info(idx, videos_df)
+    
+    # Check if the whole word exists in the dataset
+    if (videos_df['Name'] == word).any():
+        idx = videos_df.index[videos_df['Name'] == word].tolist()[0]
+        return get_video_info(idx, videos_df)
+    
+    # If the word is a single letter, check for its lowercase version
+    if is_single_letter(word) and (videos_df['Name'] == word.lower()).any():
+        idx = videos_df.index[videos_df['Name'] == word.lower()].tolist()[0]
+        return get_video_info(idx, videos_df)
+    
+    # If word not found, return None (handled in create_isl_video)
+    return None
+
+
+def get_video_info(idx, videos_df):
+    """Extract video information from dataframe row"""
+    return {
+        'link': videos_df['Link'].iloc[idx],
+        'yt_name': videos_df['yt_name'].iloc[idx],
+        'start_min': videos_df['start_min'].iloc[idx],
+        'start_sec': videos_df['start_sec'].iloc[idx],
+        'end_min': videos_df['end_min'].iloc[idx],
+        'end_sec': videos_df['end_sec'].iloc[idx]
+    }
+
+def create_isl_video(isl_text, session_id):
+    """Create an ISL video from ISL text"""
+    global videos_df
+    
+    # Load the CSV data if not already loaded
+    if videos_df is None and os.path.exists(CSV_PATH):
+        videos_df = pd.read_csv(CSV_PATH)
+    
+    if videos_df is None:
+        return None
+    
+    words = isl_text.split()
+    video_paths = []
+    
+    # Process each word
+    for word in words:
+        print(f"Processing word: {word}")
+        
+        # Try to find the word as is
+        word_info = process_word_for_video(word, videos_df)
+        
+        if word_info:
+            # We found the whole word in the dataset
+            print(f"Found whole word: {word}")
+            clip_path = process_word_clip(word, word_info)
+            if clip_path:
+                video_paths.append(clip_path)
+        else:
+            # Word not found - handle letter by letter (fingerspelling)
+            print(f"Word '{word}' not found in dataset, spelling out...")
+            for letter in word.lower():
+                # Skip non-alphabetic characters
+                if not letter.isalpha():
+                    continue
+                    
+                letter_info = process_word_for_video(letter, videos_df)
+                if letter_info:
+                    clip_path = process_word_clip(letter, letter_info)
+                    if clip_path:
+                        video_paths.append(clip_path)
+                else:
+                    print(f"Letter '{letter}' not found in dataset")
+    
+    # Combine all video clips
+    if video_paths:
+        return combine_videos(video_paths, session_id)
+    
+    return None
+
+def process_word_clip(word, word_info):
+    """Download and cut video for a specific word"""
+    # Download the YouTube video if needed
+    download_success = download_video(word_info['link'], YT_DOWNLOADS_DIR, word_info['yt_name'])
+    
+    if download_success:
+        # Cut the relevant portion
+        clip_path = cut_video(
+            word,
+            word_info['yt_name'],
+            word_info['start_min'],
+            word_info['start_sec'],
+            word_info['end_min'],
+            word_info['end_sec']
+        )
+        
+        return clip_path
+    
+    return None
+
+def combine_videos(video_paths, session_id):
+    """Combine multiple video clips into one"""
+    clips = []
+    for path in video_paths:
+        if os.path.exists(path):
+            try:
+                clip = VideoFileClip(path).without_audio()
+                clips.append(clip)
+            except Exception as e:
+                print(f"Error loading clip {path}: {str(e)}")
+    
+    if clips:
+        output_file = os.path.join(STATIC_VIDEOS, f"{session_id}.mp4")
+        try:
+            final = concatenate_videoclips(clips, method="compose")
+            final.write_videofile(output_file, audio=False)
+            
+            # Return the relative path to be used in templates
+            return f"videos/{session_id}.mp4"
+        except Exception as e:
+            print(f"Error creating final video: {str(e)}")
+    
+    return None
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/process_text', methods=['POST'])
+def process_text():
+    data = request.form
+    english_text = data.get('text', '')
+    
+    # Generate a unique session ID
+    session_id = str(uuid.uuid4())
+    
+    # Convert English to ISL
+    isl_text = text_to_isl(english_text)
+    
+    # Create ISL video
+    video_path = create_isl_video(isl_text, session_id)
+    
+    return jsonify({
+        'status': 'success',
+        'english_text': english_text,
+        'isl_text': isl_text,
+        'video_path': video_path
+    })
+
+@app.route('/process_audio', methods=['POST'])
+def process_audio():
+    # Generate a unique session ID
+    session_id = str(uuid.uuid4())
+    
+    if 'audio' in request.files:
+        audio_file = request.files['audio']
+        temp_path = os.path.join(TEMP_FOLDER, f"{session_id}.wav")
+        audio_file.save(temp_path)
+        
+        # Recognize speech
+        english_text = recognize_speech_from_file(temp_path)
+        
+        if english_text:
+            # Convert to ISL
+            isl_text = text_to_isl(english_text)
+            
+            # Create ISL video
+            video_path = create_isl_video(isl_text, session_id)
+            
+            # Clean up temp file
+            try:
+                os.remove(temp_path)
+            except:
+                pass
+            
+            return jsonify({
+                'status': 'success',
+                'english_text': english_text,
+                'isl_text': isl_text,
+                'video_path': video_path
+            })
+    
+    return jsonify({
+        'status': 'error',
+        'message': 'Failed to process audio'
+    })
+
+@app.route('/record_audio', methods=['POST'])
+def record_audio():
+    # Generate a unique session ID
+    session_id = str(uuid.uuid4())
+    
+    if 'audio' in request.files:
+        audio_file = request.files['audio']
+        temp_path = os.path.join(TEMP_FOLDER, f"{session_id}.webm")
+        audio_file.save(temp_path)
+        
+        # Convert webm to wav for speech recognition
+        wav_path = os.path.join(TEMP_FOLDER, f"{session_id}.wav")
+        command = ["ffmpeg", "-i", temp_path, wav_path]
+        try:
+            subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except:
+            return jsonify({
+                'status': 'error',
+                'message': 'Failed to convert audio format'
+            })
+            
+        # Recognize speech
+        english_text = recognize_speech_from_file(wav_path)
+        
+        if english_text:
+            # Convert to ISL
+            isl_text = text_to_isl(english_text)
+            
+            # Create ISL video
+            video_path = create_isl_video(isl_text, session_id)
+            
+            # Clean up temp files
+            try:
+                os.remove(temp_path)
+                os.remove(wav_path)
+            except:
+                pass
+            
+            return jsonify({
+                'status': 'success',
+                'english_text': english_text,
+                'isl_text': isl_text,
+                'video_path': video_path
+            })
+    
+    return jsonify({
+        'status': 'error',
+        'message': 'Failed to process audio'
+    })
+
+@app.route('/static/<path:filename>')
+def serve_static(filename):
+    return send_from_directory('static', filename)
+
+if __name__ == '__main__':
+    app.run(debug=True)
