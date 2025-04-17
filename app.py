@@ -3,6 +3,13 @@ import os
 import re
 import pandas as pd
 import speech_recognition as sr
+from PIL import Image
+
+# Fix for Pillow >=10.0 where ANTIALIAS is deprecated
+if hasattr(Image, 'Resampling'):
+    Image.ANTIALIAS = Image.Resampling.LANCZOS
+
+
 from moviepy.editor import VideoFileClip, concatenate_videoclips
 import subprocess
 import tempfile
@@ -202,32 +209,27 @@ def is_single_letter(word):
     """Check if the word is a single letter (for special handling)"""
     return len(word) == 1 and word.isalpha()
 
-def process_word_for_video(word, videos_df):
-    """Process a single word to find appropriate video clip"""
-    # Special case for "I" (pronoun) surrounded by spaces
-    if word == " I " and (videos_df['yt_name'] == "me").any():
-        # Check if "I" is surrounded by spaces (independent)
-        idx = videos_df.index[videos_df['yt_name'] == "me"].tolist()[0]
+def process_word_for_video(phrase, videos_df):
+    """Process a single word or phrase to find appropriate video clip"""
+    phrase_clean = phrase.strip().lower()
+
+    # Match against cleaned dataset entries
+    videos_df['Name_clean'] = videos_df['Name'].str.strip().str.lower()
+
+    matches = videos_df[videos_df['Name_clean'] == phrase_clean]
+    if not matches.empty:
+        idx = matches.index[0]
         return get_video_info(idx, videos_df)
-    
-    # Special case for "I" not surrounded by spaces
-    if word == "I" and (videos_df['yt_name'] == "double handed").any():
-        # Use the "double handed" version
-        idx = videos_df.index[videos_df['yt_name'] == "double handed"].tolist()[0]
-        return get_video_info(idx, videos_df)
-    
-    # Check if the whole word exists in the dataset
-    if (videos_df['Name'] == word).any():
-        idx = videos_df.index[videos_df['Name'] == word].tolist()[0]
-        return get_video_info(idx, videos_df)
-    
-    # If the word is a single letter, check for its lowercase version
-    if is_single_letter(word) and (videos_df['Name'] == word.lower()).any():
-        idx = videos_df.index[videos_df['Name'] == word.lower()].tolist()[0]
-        return get_video_info(idx, videos_df)
-    
-    # If word not found, return None (handled in create_isl_video)
+
+    # Fallback: single letter check (only if it's one char)
+    if is_single_letter(phrase_clean):
+        matches = videos_df[videos_df['Name_clean'] == phrase_clean]
+        if not matches.empty:
+            idx = matches.index[0]
+            return get_video_info(idx, videos_df)
+
     return None
+
 
 
 def get_video_info(idx, videos_df):
@@ -242,40 +244,62 @@ def get_video_info(idx, videos_df):
     }
 
 def create_isl_video(isl_text, session_id):
-    """Create an ISL video from ISL text"""
+    """Create an ISL video from ISL text, supporting phrases and fallback"""
     global videos_df
-    
+
     # Load the CSV data if not already loaded
     if videos_df is None and os.path.exists(CSV_PATH):
         videos_df = pd.read_csv(CSV_PATH)
-    
+
     if videos_df is None:
         return None
-    
+
     words = isl_text.split()
     video_paths = []
-    
-    # Process each word
-    for word in words:
+
+    i = 0
+    while i < len(words):
+        found = False
+
+        # Try to match 3-word phrases
+        if i + 2 < len(words):
+            phrase3 = " ".join(words[i:i+3])
+            info = process_word_for_video(phrase3, videos_df)
+            if info:
+                print(f"Found 3-word phrase: {phrase3}")
+                clip_path = process_word_clip(phrase3, info)
+                if clip_path:
+                    video_paths.append(clip_path)
+                i += 3
+                continue
+
+        # Try to match 2-word phrases
+        if i + 1 < len(words):
+            phrase2 = " ".join(words[i:i+2])
+            info = process_word_for_video(phrase2, videos_df)
+            if info:
+                print(f"Found 2-word phrase: {phrase2}")
+                clip_path = process_word_clip(phrase2, info)
+                if clip_path:
+                    video_paths.append(clip_path)
+                i += 2
+                continue
+
+        # Fallback to single word
+        word = words[i]
         print(f"Processing word: {word}")
-        
-        # Try to find the word as is
-        word_info = process_word_for_video(word, videos_df)
-        
-        if word_info:
-            # We found the whole word in the dataset
-            print(f"Found whole word: {word}")
-            clip_path = process_word_clip(word, word_info)
+        info = process_word_for_video(word, videos_df)
+        if info:
+            print(f"Found single word: {word}")
+            clip_path = process_word_clip(word, info)
             if clip_path:
                 video_paths.append(clip_path)
         else:
-            # Word not found - handle letter by letter (fingerspelling)
+            # Fallback to fingerspelling
             print(f"Word '{word}' not found in dataset, spelling out...")
             for letter in word.lower():
-                # Skip non-alphabetic characters
                 if not letter.isalpha():
                     continue
-                    
                 letter_info = process_word_for_video(letter, videos_df)
                 if letter_info:
                     clip_path = process_word_clip(letter, letter_info)
@@ -283,12 +307,15 @@ def create_isl_video(isl_text, session_id):
                         video_paths.append(clip_path)
                 else:
                     print(f"Letter '{letter}' not found in dataset")
-    
+
+        i += 1
+
     # Combine all video clips
     if video_paths:
         return combine_videos(video_paths, session_id)
-    
+
     return None
+
 
 def process_word_clip(word, word_info):
     """Download and cut video for a specific word"""
@@ -311,28 +338,39 @@ def process_word_clip(word, word_info):
     return None
 
 def combine_videos(video_paths, session_id):
-    """Combine multiple video clips into one"""
+    """Combine multiple video clips into one with uniform resolution"""
     clips = []
+    base_resolution = None  # We'll use the first clip's resolution as reference
+
     for path in video_paths:
         if os.path.exists(path):
             try:
                 clip = VideoFileClip(path).without_audio()
+                
+                # Set base resolution from the first valid clip
+                if base_resolution is None:
+                    base_resolution = clip.size  # (width, height)
+
+                # Resize the clip if it doesn't match the base resolution
+                if clip.size != base_resolution:
+                    clip = clip.resize(newsize=base_resolution)
+
                 clips.append(clip)
             except Exception as e:
-                print(f"Error loading clip {path}: {str(e)}")
-    
+                print(f"Error loading or resizing clip {path}: {str(e)}")
+
     if clips:
         output_file = os.path.join(STATIC_VIDEOS, f"{session_id}.mp4")
         try:
             final = concatenate_videoclips(clips, method="compose")
             final.write_videofile(output_file, audio=False)
-            
-            # Return the relative path to be used in templates
+
             return f"videos/{session_id}.mp4"
         except Exception as e:
             print(f"Error creating final video: {str(e)}")
-    
+
     return None
+
 
 @app.route('/')
 def index():
