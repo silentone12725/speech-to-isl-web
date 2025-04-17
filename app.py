@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import uuid
 import time
+import requests
 
 app = Flask(__name__)
 
@@ -31,21 +32,77 @@ if os.path.exists(CSV_PATH):
 
 def download_and_convert_video(url, download_path, filename):
     """Download and convert video from a non-YouTube URL"""
-    video_path = os.path.join(download_path, filename + ".mp4")
+    # First determine the file extension from the URL
+    file_extension = os.path.splitext(url)[1] if os.path.splitext(url)[1] else ".mp4"
+    video_path = os.path.join(download_path, filename + file_extension)
+    mp4_path = os.path.join(download_path, filename + ".mp4")
     
-    # Check if the video already exists
-    if os.path.exists(video_path):
+    # Check if the final MP4 already exists
+    if os.path.exists(mp4_path):
         return True
     
+    # Special handling for talkinghands.co.in webm files
+    if "talkinghands.co.in" in url and url.endswith(".webm"):
+        try:
+            # Use yt-dlp for better web video handling
+            command = [
+                "yt-dlp",
+                "--no-check-certificate",  # Skip SSL verification
+                "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                "-o", video_path,
+                url
+            ]
+            
+            subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            
+            # Convert to MP4 if needed
+            if file_extension.lower() != ".mp4" and os.path.exists(video_path):
+                command = ["ffmpeg", "-i", video_path, "-c:v", "libx264", "-c:a", "aac", mp4_path]
+                subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                
+                # Remove the original file after conversion
+                if os.path.exists(mp4_path):
+                    os.remove(video_path)
+                    return True
+            return os.path.exists(video_path) or os.path.exists(mp4_path)
+        
+        except Exception as e:
+            print(f"Error downloading with yt-dlp: {str(e)}")
+            # Fall back to requests method
+    
+    # Standard method for other URLs
     try:
-        # Send a request to get the video content
-        response = requests.get(url, stream=True)
+        # Set headers to mimic a browser request
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': '*/*',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Referer': 'https://talkinghands.co.in/'  # Add referrer for talkinghands.co.in
+        }
+        
+        # Send a request to get the video content with headers
+        response = requests.get(url, stream=True, headers=headers, verify=False)  # Skip SSL verification
         response.raise_for_status()  # Check for HTTP errors
         
         # Write the content to a file
         with open(video_path, "wb") as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
+        
+        # Convert to MP4 if needed
+        if file_extension.lower() != ".mp4":
+            try:
+                command = ["ffmpeg", "-i", video_path, "-c:v", "libx264", "-c:a", "aac", mp4_path]
+                subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                
+                # Remove the original file after conversion
+                if os.path.exists(mp4_path):
+                    os.remove(video_path)
+                    return True
+            except Exception as e:
+                print(f"Error converting video: {str(e)}")
+                # If conversion fails, continue with the original format
         
         return True
     except requests.exceptions.RequestException as e:
@@ -111,7 +168,7 @@ def text_to_isl(sentence):
     pattern = r'[^\w\s]'
     sentence = re.sub(pattern, '', sentence)
     
-    # Simple stopword filtering
+    # Define stopwords - extend the set from your existing implementation
     stopwords_set = set(['a', 'an', 'the', 'is', 'to', 'The', 'in', 'of', 'us', 'and', 'are', 'this', 'that', 'it'])
     
     # Convert to lowercase and filter out stopwords, but preserve "I" as is
