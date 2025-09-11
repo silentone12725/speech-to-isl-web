@@ -1,0 +1,50 @@
+# Flask Web Framework
+Flask==2.3.3
+
+# Data Processing
+pandas==2.0.3
+numpy==1.24.3
+
+# Computer Vision and Image Processing
+opencv-python==4.8.1.78
+Pillow==10.0.1
+
+# Video Processing
+moviepy==1.0.3
+
+# Audio Processing and Speech Recognition
+SpeechRecognition==3.10.0
+pyaudio
+
+# HTTP Requests
+requests==2.31.0
+
+# Natural Language Processing (for main.py enhanced version)
+nltk==3.7
+
+# Additional dependencies that might be needed
+# System and file operations
+# Note: uuid is built-in to Python, but some versions might need this
+
+# Audio format conversion dependencies (handled by system ffmpeg)
+# ffmpeg-python==0.2.0  # Alternative to system ffmpeg if needed
+
+# Optional: For better audio handling
+# pydub==0.25.1
+
+# Development and testing
+# pytest==7.4.2
+# pytest-flask==1.2.0
+
+# Security (recommended for production)
+# Werkzeug==2.3.7  # Usually comes with Flask but good to specify
+
+# Additional system-level dependencies (install via system package manager):
+# - ffmpeg (for audio/video conversion)
+# - yt-dlp (for YouTube video downloads)
+# - Java JDK (for Stanford Parser in main.py)
+
+# Note: Some dependencies require system-level installations:
+# Ubuntu/Debian: sudo apt-get install ffmpeg default-jdk
+# macOS: brew install ffmpeg openjdk
+# Windows: Download and install ffmpeg and Java JDK manually
